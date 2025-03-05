@@ -6,59 +6,27 @@ import base64
 import json
 import os
 import time
+from dotenv import load_dotenv
 
 class FoodCalorieDetector:
     def __init__(self):
         # Streamlit page configuration
         st.set_page_config(page_title="Food Calorie Detector", page_icon="🍽️")
         st.title("Real-Time Food Calorie Detector")
-        
+       
         # API Key Configuration
         self.api_key = self.get_api_key()
-        
+       
         # Initialize session state variables
         if 'capture' not in st.session_state:
             st.session_state.capture = False
         if 'last_analysis_time' not in st.session_state:
             st.session_state.last_analysis_time = 0
-    
-    def get_api_key(self):
-        """
-        Retrieve API key with multiple fallback methods
-        """
-        # Method 1: Environment Variable
-        env_key = os.environ.get('OPENROUTER_API_KEY')
-        if env_key:
-            return env_key
-        
-        # Method 2: Streamlit Secrets
-        try:
-            secrets_key = st.secrets.get("OPENROUTER_API_KEY")
-            if secrets_key:
-                return secrets_key
-        except Exception:
-            pass
-        
-        # Method 3: Hardcoded Key (Not Recommended)
-        hardcoded_key = "your_actual_api_key_here"
-        
-        # Method 4: User Input
-        user_input_key = st.text_input(
-            "Enter your OpenRouter API Key", 
-            type="password", 
-            key="api_key_input",
-            help="You can get your API key from OpenRouter.ai"
-        )
-        
-        # Priority: User Input > Hardcoded > Empty
-        api_key = user_input_key or hardcoded_key
-        
-        # Validate API Key
-        if not api_key or len(api_key) < 10:
-            st.error("Please provide a valid API key from OpenRouter.ai")
-            st.stop()
-        
-        return api_key
+   
+    @staticmethod
+    def get_api_key():
+        load_dotenv()
+        return os.environ.get('OPENROUTER_API_KEY')
     
     def encode_image(self, image):
         """Convert OpenCV image to base64 encoded string"""

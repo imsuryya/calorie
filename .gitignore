@@ -1,2 +1,5 @@
 .env
 secrets.toml
+yolov3.cfg
+yolov3.weights
+coco.names

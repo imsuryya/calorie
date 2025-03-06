@@ -1,148 +1,182 @@
 import streamlit as st
 import cv2
-import base64
-import requests
-import os
-import json
+import numpy as np
 import time
-from dotenv import load_dotenv
+import os
 from PIL import Image
 import io
 
-# Load environment variables
-load_dotenv()
-
 # Set page configuration
 st.set_page_config(
-    page_title="Food Analyzer",
+    page_title="Real-time Food Detector",
     page_icon="🍽️",
     layout="wide"
 )
 
 # Header
-st.title("🍽️ Real-time Food Analyzer")
-st.markdown("This application uses AI to identify food items and estimate their nutritional content.")
+st.title("🍽️ Real-time Food Detector")
+st.markdown("This application uses YOLO to identify food items in your camera feed in real-time.")
 
-# Function to encode the image to base64
-def encode_image(image):
-    # Convert OpenCV image to PIL Image
-    pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    
-    # Create a bytes buffer for the image
-    buffered = io.BytesIO()
-    
-    # Save the image to the buffer as JPEG
-    pil_img.save(buffered, format="JPEG")
-    
-    # Encode the image as base64
-    img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    
-    return img_str
+# Food categories that YOLO can detect
+FOOD_CLASSES = [
+    'apple', 'banana', 'orange', 'broccoli', 'carrot', 'hot dog', 
+    'pizza', 'donut', 'cake', 'sandwich', 'bowl', 'cup'
+]
 
-# Function to analyze the food in the image using OpenRouter API
-def analyze_food(image):
-    api_key = os.getenv("OPENROUTER_API_KEY")
+# Dictionary with approximate calories for common foods
+FOOD_CALORIES = {
+    'apple': '95 calories',
+    'banana': '105 calories',
+    'orange': '62 calories',
+    'broccoli': '55 calories per cup',
+    'carrot': '50 calories per cup',
+    'hot dog': '150 calories',
+    'pizza': '285 calories per slice',
+    'donut': '195 calories',
+    'cake': '350 calories per slice',
+    'sandwich': '200-500 calories',
+    'bowl': 'Depends on contents',
+    'cup': 'Depends on contents'
+}
+
+# Function to load YOLO model
+@st.cache_resource
+def load_yolo_model():
+    # Load YOLO weights and config
+    weights_path = os.path.join(os.path.dirname(__file__), "yolov3.weights")
+    config_path = os.path.join(os.path.dirname(__file__), "yolov3.cfg")
     
-    if not api_key:
-        st.error("OpenRouter API key is missing. Please set it in your .env file.")
+    # Check if files exist
+    if not os.path.exists(weights_path) or not os.path.exists(config_path):
+        st.error(f"YOLO files not found. Please download yolov3.weights and yolov3.cfg to {os.path.dirname(__file__)}")
         return None
     
-    # Encode the image to base64
-    base64_image = encode_image(image)
+    # Load YOLO network
+    net = cv2.dnn.readNetFromDarknet(config_path, weights_path)
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
     
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    prompt = ("Analyze the given food image and estimate the calorie content. "
-              "Break down the calorie values based on individual food items if multiple items are detected. "
-              "Also, provide an estimated macronutrient distribution (carbohydrates, proteins, and fats) if possible. "
-              "Return your response in JSON format with the following structure: "
-              "{'food_items': [{'name': 'item name', 'calories': X, 'carbs': X, 'protein': X, 'fat': X}], "
-              "'total_calories': X, 'total_carbs': X, 'total_protein': X, 'total_fat': X}")
-    
-    data = {
-        "model": "qwen/qwen2.5-vl-72b-instruct",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": f"data:image/jpeg;base64,{base64_image}"
-                    }
-                ]
-            }
-        ],
-        "max_tokens": 1024
-    }
-    
+    # Try to use GPU if available
     try:
-        with st.spinner("Analyzing food..."):
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=data
-            )
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+    except:
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+    
+    # Get layer names
+    layer_names = net.getLayerNames()
+    output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+    
+    return net, output_layers
+
+# Function to detect objects in an image
+def detect_objects(frame, net, output_layers):
+    height, width, _ = frame.shape
+    
+    # Create a blob from the image
+    blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+    
+    # Set input for the network
+    net.setInput(blob)
+    
+    # Run forward pass
+    outputs = net.forward(output_layers)
+    
+    # Initialize lists for detected objects
+    class_ids = []
+    confidences = []
+    boxes = []
+    
+    # Process each output layer
+    for output in outputs:
+        for detection in output:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
             
-            if response.status_code == 200:
-                result = response.json()
-                content = result["choices"][0]["message"]["content"]
+            # Filter out weak predictions
+            if confidence > 0.5:
+                # Object detected
+                center_x = int(detection[0] * width)
+                center_y = int(detection[1] * height)
+                w = int(detection[2] * width)
+                h = int(detection[3] * height)
                 
-                # Try to extract JSON from the response
-                try:
-                    # Look for JSON in the response
-                    import re
-                    json_match = re.search(r'```json\n(.*?)\n```', content, re.DOTALL)
-                    if json_match:
-                        json_str = json_match.group(1)
-                    else:
-                        # If no code block, try to find JSON directly
-                        json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                        if json_match:
-                            json_str = json_match.group(0)
-                        else:
-                            # If JSON parsing fails, return the text response
-                            return {
-                                "raw_response": content,
-                                "food_items": [{"name": "Food Analysis", "calories": "See details", "carbs": "-", "protein": "-", "fat": "-"}],
-                                "total_calories": "See details"
-                            }
-                    
-                    return json.loads(json_str)
-                except Exception as e:
-                    # If JSON parsing fails, return the text response in a user-friendly format
-                    return {
-                        "error": str(e),
-                        "raw_response": content,
-                        "food_items": [{"name": "Food Analysis", "calories": "See details", "carbs": "-", "protein": "-", "fat": "-"}],
-                        "total_calories": "See details"
-                    }
-            else:
-                return {"error": f"API request failed with status code {response.status_code}", "details": response.text}
-    except Exception as e:
-        return {"error": str(e)}
+                # Rectangle coordinates
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
+                
+                boxes.append([x, y, w, h])
+                confidences.append(float(confidence))
+                class_ids.append(class_id)
+    
+    # Apply non-max suppression to remove overlapping boxes
+    indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+    
+    # Load COCO class names
+    with open(os.path.join(os.path.dirname(__file__), "coco.names"), "r") as f:
+        classes = [line.strip() for line in f.readlines()]
+    
+    # Prepare results
+    results = []
+    for i in range(len(boxes)):
+        if i in indexes:
+            x, y, w, h = boxes[i]
+            label = str(classes[class_ids[i]])
+            confidence = confidences[i]
+            results.append((label, confidence, (x, y, w, h)))
+    
+    return results
 
-# Create two columns with better proportions
-col1, col2 = st.columns([0.6, 0.4])
+# Function to process frame and draw results
+def process_frame(frame, net, output_layers):
+    # Detect objects
+    results = detect_objects(frame, net, output_layers)
+    
+    # Draw bounding boxes
+    for label, confidence, (x, y, w, h) in results:
+        if label in FOOD_CLASSES:  # Only show food items
+            # Draw rectangle
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            
+            # Draw label with confidence
+            text = f"{label}: {confidence:.2f}"
+            cv2.putText(frame, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    
+    # Return processed frame and food items
+    food_items = [item for item in results if item[0] in FOOD_CLASSES]
+    return frame, food_items
 
-# Initialize session state for camera
+# Function to generate analysis text
+def generate_analysis(food_items):
+    if not food_items:
+        return "No food items detected in the frame."
+    
+    # Create a list of detected food items
+    foods = {}
+    for label, confidence, _ in food_items:
+        if label in foods:
+            foods[label] = max(foods[label], confidence)
+        else:
+            foods[label] = confidence
+    
+    # Generate analysis text
+    analysis = "### Detected Food Items:\n\n"
+    for food, confidence in foods.items():
+        analysis += f"- **{food.title()}** (confidence: {confidence:.2f})\n"
+        if food in FOOD_CALORIES:
+            analysis += f"  - Approx. {FOOD_CALORIES[food]}\n"
+    
+    return analysis
+
+# Initialize session state
 if 'camera_on' not in st.session_state:
     st.session_state.camera_on = False
-
+if 'analysis_result' not in st.session_state:
+    st.session_state.analysis_result = None
 if 'last_analysis_time' not in st.session_state:
     st.session_state.last_analysis_time = 0
 
-if 'analysis_result' not in st.session_state:
-    st.session_state.analysis_result = None
-
-if 'frame_to_analyze' not in st.session_state:
-    st.session_state.frame_to_analyze = None
+# Create two columns with better proportions
+col1, col2 = st.columns([0.6, 0.4])
 
 # Toggle camera function
 def toggle_camera():
@@ -161,117 +195,92 @@ with col1:
     
     # Camera feed placeholder
     camera_placeholder = st.empty()
-    
-    # Analyze button
-    if st.session_state.camera_on:
-        if st.button("Analyze Current Frame", use_container_width=True):
-            if st.session_state.frame_to_analyze is not None:
-                st.session_state.analysis_result = analyze_food(st.session_state.frame_to_analyze)
-                st.session_state.last_analysis_time = time.time()
 
 # Results in the second column
 with col2:
-    st.header("Analysis Results")
-    result_placeholder = st.container()  # Use container instead of empty to ensure visibility
+    st.header("Real-time Analysis")
+    result_placeholder = st.container()
 
 # Display camera feed if the camera is on
 if st.session_state.camera_on:
-    cap = cv2.VideoCapture(0)
+    # Load YOLO model
+    model_result = load_yolo_model()
     
-    if not cap.isOpened():
-        st.error("Could not open webcam. Please check your camera connection.")
-        st.session_state.camera_on = False
+    if model_result is None:
+        st.error("Failed to load YOLO model. Please check if the model files are available.")
     else:
-        try:
-            while st.session_state.camera_on:
-                ret, frame = cap.read()
-                if not ret:
-                    st.error("Failed to capture image")
-                    break
+        net, output_layers = model_result
+        
+        cap = cv2.VideoCapture(0)
+        
+        if not cap.isOpened():
+            st.error("Could not open webcam. Please check your camera connection.")
+            st.session_state.camera_on = False
+        else:
+            try:
+                stframe = camera_placeholder.empty()
+                last_analysis_time = 0
                 
-                # Store the current frame for analysis
-                st.session_state.frame_to_analyze = frame.copy()
-                
-                # Convert the color from BGR to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Display the camera feed - fixed deprecated parameter
-                camera_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-                
-                # Wait for a short time to update the UI
-                time.sleep(0.1)
-                
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
-        finally:
-            cap.release()
+                while st.session_state.camera_on:
+                    ret, frame = cap.read()
+                    if not ret:
+                        st.error("Failed to capture image")
+                        break
+                    
+                    # Process frame
+                    current_time = time.time()
+                    if current_time - last_analysis_time >= 1:  # Update analysis every second
+                        processed_frame, food_items = process_frame(frame.copy(), net, output_layers)
+                        
+                        # Generate analysis
+                        analysis = generate_analysis(food_items)
+                        st.session_state.analysis_result = analysis
+                        st.session_state.last_analysis_time = current_time
+                        
+                        last_analysis_time = current_time
+                    else:
+                        # Just process frame for display without updating analysis
+                        processed_frame, _ = process_frame(frame.copy(), net, output_layers)
+                    
+                    # Convert the color from BGR to RGB
+                    frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Display the camera feed
+                    stframe.image(frame_rgb, caption="Camera Feed", use_container_width=True)
+                    
+                    # Wait for a short time to update the UI
+                    time.sleep(0.03)
+                    
+            except Exception as e:
+                st.error(f"Camera Error: {str(e)}")
+            finally:
+                cap.release()
 
-# Display analysis results if available - always show the container
+# Display analysis results if available
 with result_placeholder:
     if st.session_state.analysis_result:
-        result = st.session_state.analysis_result
-        
-        if "error" in result:
-            st.error(f"Analysis Error: {result['error']}")
-            if "raw_response" in result:
-                with st.expander("Show raw response", expanded=True):
-                    st.write(result["raw_response"])
-        
-        # Display food items
-        if "food_items" in result:
-            for item in result["food_items"]:
-                with st.expander(f"{item['name']} - {item.get('calories', 'N/A')} kcal", expanded=True):
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Carbs", f"{item.get('carbs', 'N/A')}g")
-                    col2.metric("Protein", f"{item.get('protein', 'N/A')}g")
-                    col3.metric("Fat", f"{item.get('fat', 'N/A')}g")
-        
-        # Display total nutrition if available
-        if "total_calories" in result:
-            st.subheader("Total Nutrition")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Calories", f"{result.get('total_calories', 'N/A')} kcal")
-            col2.metric("Carbs", f"{result.get('total_carbs', 'N/A')}g")
-            col3.metric("Protein", f"{result.get('total_protein', 'N/A')}g")
-            col4.metric("Fat", f"{result.get('total_fat', 'N/A')}g")
-        
-        # Display raw response if JSON parsing failed but we have a response
-        if "raw_response" in result and not result.get("error"):
-            with st.expander("Detailed Analysis", expanded=True):
-                st.write(result["raw_response"])
-        
-        # Display when the analysis was done
-        st.caption(f"Analysis completed {time.strftime('%H:%M:%S', time.localtime(st.session_state.last_analysis_time))}")
+        st.markdown(st.session_state.analysis_result)
+        st.caption(f"Last updated: {time.strftime('%H:%M:%S', time.localtime(st.session_state.last_analysis_time))}")
     else:
-        # Show a placeholder message when no analysis has been performed
-        st.info("No analysis results yet. Start the camera and click 'Analyze Current Frame' to see results.")
+        st.info("No analysis results yet. Real-time analysis will appear here once the camera captures frames.")
 
-# Instructions
-st.markdown("---")
-st.subheader("How to use")
-st.markdown("""
-1. Click the 'Start Camera' button to turn on your webcam
-2. Position your food in the camera view
-3. Click 'Analyze Current Frame' to get nutritional information
-4. Review the analysis results in the right panel
-""")
-
-# Environment setup instructions
-st.sidebar.title("Setup Instructions")
-st.sidebar.info("""
-Before running this app, you need to:
-
-1. Create a `.env` file in the same directory as your script
-2. Add your OpenRouter API key to the `.env` file:
-   ```
-   OPENROUTER_API_KEY=your_api_key_here
-   ```
-3. Install required dependencies:
-   ```
-   pip install streamlit opencv-python python-dotenv requests pillow
-   ```
-4. Run the app:
-   ```
-   streamlit run app.py
-   ```
-""")
+# Add instructions in the sidebar
+with st.sidebar:
+    st.header("Instructions")
+    st.markdown("""
+    1. Click the "Start Camera" button to begin
+    2. Position food items in front of your camera
+    3. The app will detect and analyze food items in real-time
+    4. Nutritional information will be displayed when available
+    """)
+    
+    st.header("Note")
+    st.markdown("""
+    This application uses YOLOv3 for object detection. It can detect these food items:
+    - Apple, Banana, Orange
+    - Broccoli, Carrot
+    - Hot Dog, Pizza, Donut, Cake, Sandwich
+    - Bowl, Cup (containers)
+    
+    For more accurate nutritional analysis, consider using a specialized food recognition API.
+    """)
